@@ -7883,7 +7883,10 @@ async def sync_wechat_article(body: WechatArticleSyncIn):
                 setattr(record, key, value)
         if metric.read_display:
             record.read_display = metric.read_display
-        record.source = metric.source
+        has_public_metric = any(getattr(metric, f"{name}_count") is not None
+                                for name in ("read", "like", "share", "collect", "comment"))
+        if has_public_metric:
+            record.source = metric.source
         record.last_collected_at = datetime.utcnow()
         missing = [name for name in ("read", "like", "share", "collect", "comment")
                    if getattr(metric, f"{name}_count") is None]
@@ -7899,7 +7902,7 @@ async def sync_wechat_article(body: WechatArticleSyncIn):
             share_count=record.share_count,
             collect_count=record.collect_count,
             comment_count=record.comment_count,
-            source=metric.source,
+            source=metric.source if has_public_metric else record.source,
         ))
         s.add(record)
         s.commit()
