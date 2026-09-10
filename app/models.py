@@ -264,6 +264,37 @@ class ContentRecord(SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
+class WechatArticleRecord(SQLModel, table=True):
+    """公众号文章的当前指标。每个链接只保留一条当前记录。"""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    url: str = Field(index=True)
+    title: str = ""
+    read_count: Optional[int] = None
+    read_display: str = ""
+    like_count: Optional[int] = None
+    share_count: Optional[int] = None
+    collect_count: Optional[int] = None
+    comment_count: Optional[int] = None
+    source: str = "public_page"
+    last_collected_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+    last_error: str = ""
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class WechatArticleMetricSnapshot(SQLModel, table=True):
+    """公众号文章每次采集的指标快照，用于其他 Agent 计算增长。"""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    article_id: int = Field(index=True)
+    sampled_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+    read_count: Optional[int] = None
+    read_display: str = ""
+    like_count: Optional[int] = None
+    share_count: Optional[int] = None
+    collect_count: Optional[int] = None
+    comment_count: Optional[int] = None
+    source: str = "public_page"
+
+
 class CommentWatchIdReservation(SQLModel, table=True):
     """Do not assign a deleted comment monitor's ID to a new task."""
     __table_args__ = {"sqlite_autoincrement": True}

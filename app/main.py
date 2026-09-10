@@ -78,6 +78,9 @@ from .platforms.kuaishou import (resolve_ks_user_id, resolve_ks_photo_id,
                   parse_self_user as parse_ks_self_user,
                   MANAGE_URL as KS_MANAGE_URL)
 from .platforms.channels import parse_self_user as parse_channels_self_user
+from .platforms.wechat_article import (
+    WechatArticleError, fetch_article_metrics, normalize_article_url,
+)
 from .engine import Downloader, MonitorEngine
 from .engine.share_downloader import (
     clean_platform_share_target,
@@ -98,7 +101,8 @@ from .models import (ContentRecord, CommentRecord, CommentRule, CommentTask,
                       AccountActionTask, AccountStatSnapshot,
                       ShareDownloadRecord, AccountRiskState, RiskEvent, RiskAdminAudit,
                       KeywordCollectionJob, KeywordCollectionContent,
-                      KeywordCollectionComment)
+                      KeywordCollectionComment, WechatArticleRecord,
+                      WechatArticleMetricSnapshot)
 from .notifier import CHANNEL_TYPES, send_one
 from .profiles import (allocate_profile_dir, ensure_identity, migrate_identities,
                        assign_proxy_from_pool,
@@ -7818,6 +7822,189 @@ async def retry_download(cid: int):
     if not engine:
         raise HTTPException(503, "引擎未就绪")
     return await engine.retry_download(cid)
+
+
+class WechatArticleSyncIn(BaseModel):
+    url: str
+
+
+class WechatArticleMetricIn(BaseModel):
+    """由本机视觉 Agent 从 PC 微信文章窗口识别出的底部指标。"""
+    read_count: int | None = PydanticField(default=None, ge=0)
+    read_display: str = ""
+    like_count: int | None = PydanticField(default=None, ge=0)
+    share_count: int | None = PydanticField(default=None, ge=0)
+    collect_count: int | None = PydanticField(default=None, ge=0)
+    comment_count: int | None = PydanticField(default=None, ge=0)
+
+
+def _wechat_article_dict(record: WechatArticleRecord) -> dict:
+    return {
+        "id": record.id,
+        "url": record.url,
+        "title": record.title,
+        "read_count": record.read_count,
+        "read_display": record.read_display,
+        "like_count": record.like_count,
+        "share_count": record.share_count,
+        "collect_count": record.collect_count,
+        "comment_count": record.comment_count,
+        "source": record.source,
+        "last_collected_at": record.last_collected_at.isoformat(),
+        "last_error": record.last_error,
+        "created_at": record.created_at.isoformat(),
+    }
+
+
+@app.post("/api/wechat/articles/sync")
+async def sync_wechat_article(body: WechatArticleSyncIn):
+    """采集一篇公众号文章的公开页指标；供本机其他 Agent 调用。"""
+    try:
+        metric = await fetch_article_metrics(body.url)
+    except WechatArticleError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, f"公众号文章采集失败: {exc}") from exc
+
+    with get_session() as s:
+        record = s.exec(
+            select(WechatArticleRecord)
+            .where(WechatArticleRecord.url == metric.url)
+        ).first()
+        if not record:
+            record = WechatArticleRecord(url=metric.url)
+            s.add(record)
+            s.flush()
+        record.title = metric.title or record.title
+        for key in ("read_count", "like_count", "share_count",
+                    "collect_count", "comment_count"):
+            value = getattr(metric, key)
+            if value is not None:
+                setattr(record, key, value)
+        if metric.read_display:
+            record.read_display = metric.read_display
+        record.source = metric.source
+        record.last_collected_at = datetime.utcnow()
+        missing = [name for name in ("read", "like", "share", "collect", "comment")
+                   if getattr(metric, f"{name}_count") is None]
+        record.last_error = (
+            "公开页未返回 " + "、".join(missing) + " 指标；等待 PC 微信会话采集"
+            if missing else ""
+        )
+        s.add(WechatArticleMetricSnapshot(
+            article_id=record.id,
+            read_count=record.read_count,
+            read_display=record.read_display,
+            like_count=record.like_count,
+            share_count=record.share_count,
+            collect_count=record.collect_count,
+            comment_count=record.comment_count,
+            source=metric.source,
+        ))
+        s.add(record)
+        s.commit()
+        s.refresh(record)
+        return _wechat_article_dict(record)
+
+
+@app.get("/api/wechat/articles")
+async def list_wechat_articles(limit: int = 100):
+    limit = max(1, min(limit, 1000))
+    with get_session() as s:
+        rows = s.exec(
+            select(WechatArticleRecord)
+            .order_by(WechatArticleRecord.last_collected_at.desc())
+            .limit(limit)
+        ).all()
+        return [_wechat_article_dict(row) for row in rows]
+
+
+@app.get("/api/wechat/articles/{article_id}/metrics")
+async def wechat_article_metric_series(article_id: int, limit: int = 200):
+    limit = max(2, min(limit, 2000))
+    with get_session() as s:
+        record = s.get(WechatArticleRecord, article_id)
+        if not record:
+            raise HTTPException(404, "公众号文章记录不存在")
+        rows = s.exec(
+            select(WechatArticleMetricSnapshot)
+            .where(WechatArticleMetricSnapshot.article_id == article_id)
+            .order_by(WechatArticleMetricSnapshot.sampled_at.desc(),
+                      WechatArticleMetricSnapshot.id.desc())
+            .limit(limit)
+        ).all()
+    snapshots, previous = [], None
+    for row in reversed(rows):
+        item = {
+            "id": row.id,
+            "sampled_at": row.sampled_at.isoformat(),
+            "read_count": row.read_count,
+            "read_display": row.read_display,
+            "like_count": row.like_count,
+            "share_count": row.share_count,
+            "collect_count": row.collect_count,
+            "comment_count": row.comment_count,
+            "source": row.source,
+        }
+        for name in ("read", "like", "share", "collect", "comment"):
+            key = f"{name}_count"
+            item[f"{name}_delta"] = (
+                item[key] - previous[key]
+                if previous and item[key] is not None and previous[key] is not None
+                else 0
+            )
+        snapshots.append(item)
+        previous = item
+    return {"article": _wechat_article_dict(record), "snapshots": snapshots}
+
+
+@app.post("/api/wechat/articles/{article_id}/metrics")
+async def ingest_wechat_article_metrics(article_id: int,
+                                        body: WechatArticleMetricIn):
+    """接收 PC 微信视觉采集结果，并追加一条可计算增量的快照。"""
+    metric_names = ("read", "like", "share", "collect", "comment")
+    supplied = any(getattr(body, f"{name}_count") is not None
+                   for name in metric_names)
+    if not supplied and not body.read_display.strip():
+        raise HTTPException(400, "至少提交一项公众号文章指标")
+
+    with get_session() as s:
+        record = s.get(WechatArticleRecord, article_id)
+        if not record:
+            raise HTTPException(404, "公众号文章记录不存在")
+        for name in metric_names:
+            value = getattr(body, f"{name}_count")
+            if value is not None:
+                setattr(record, f"{name}_count", value)
+        if body.read_display.strip():
+            record.read_display = body.read_display.strip()
+        record.source = "pc_wechat_visual"
+        record.last_collected_at = datetime.utcnow()
+        missing = [name for name in metric_names
+                   if getattr(record, f"{name}_count") is None]
+        record.last_error = (
+            "PC 微信窗口尚未识别 " + "、".join(missing) + " 指标"
+            if missing else ""
+        )
+        snapshot = WechatArticleMetricSnapshot(
+            article_id=record.id,
+            read_count=record.read_count,
+            read_display=record.read_display,
+            like_count=record.like_count,
+            share_count=record.share_count,
+            collect_count=record.collect_count,
+            comment_count=record.comment_count,
+            source=record.source,
+        )
+        s.add(snapshot)
+        s.add(record)
+        s.commit()
+        s.refresh(record)
+        s.refresh(snapshot)
+        return {
+            "article": _wechat_article_dict(record),
+            "snapshot_id": snapshot.id,
+        }
 
 
 def _delete_content_files(rec: ContentRecord):

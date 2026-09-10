@@ -160,6 +160,9 @@ npm install
 
 ## 基本使用
 
+公众号文章指标的 Agent 调用、PC 微信视觉采集边界、接口契约与重构说明见
+[WECHAT_ARTICLE_AGENT_API.md](WECHAT_ARTICLE_AGENT_API.md)。
+
 ### 1. 添加账号
 
 1. 在顶部选择平台。
